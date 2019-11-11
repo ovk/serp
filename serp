@@ -1,0 +1,336 @@
+#!/usr/bin/env sh
+#
+# MIT License
+#
+# Copyright (c) 2019 ovk
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+version=1.0.0
+
+err() {
+    printf "[Error] %s\n" "$1" 1>&2
+}
+
+dbg() {
+    if [ -n "$opt_verbose" ]; then
+        printf "%s\n" "$1"
+    fi
+}
+
+has() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+print_version() {
+    printf "%s" "\
+serp $version
+Copyright (c) 2019 ovk.
+License: MIT License.
+This is free software: you are free to change and redistribute it.
+The software is provided \"AS IS\", WITHOUT WARRANTY of any kind.
+"
+}
+
+usage() {
+    printf "%s" "\
+Usage: serp ACTION [OPTION]... DIRECTORY
+
+Serp is a CLI tool to simplify creation of compressed encrypted packages with
+parity (data redundancy) information.
+
+Serp is implemented as a POSIX compliant shell script that essentially is
+a wrapper around following tools: tar (for packaging directory contents into
+a single file), GPG (for compressing and encrypting the package), sha1sum
+(for ensuring data integrity), PAR2 (for generating parity information).
+
+Options:
+
+An ACTION argument can be one of the following:
+
+    -p, --pack          Pack DIRECTORY contents into single archive file.
+                        Default archive file name is DIRECTORY.tar.gpg.
+                        The archive file name can be changed using
+                        -n, --name argument.
+
+    -u, --unpack        Unpack contents of an archive into DIRECTORY.
+                        By default look for archive file ./DIRECTORY.tar.gpg.
+                        The archive file name can be changed using
+                        -n, --name argument.
+
+An OPTION can be on of the following:
+
+    -n, --name          Specify the name of the archive file
+                        (default: DIRECTORY.tar.gpg).
+                        The name must be supplied without file extension
+                        (e.g. 'myfile', not 'myfile.tar.gpg').
+    -r, --redundancy    Redundancy level in percents (default: 10).
+                        This parameter is passed to par2 as-is.
+    -X, --delete        Delete DIRECTORY after successful packing.
+                        Note that directory is deleted simply with 'rm -rf'
+                        which does not securely destroy original (unencrypted)
+                        data. To securely wipe data you can use tools such as
+                        'shred'; however, be aware of its limitations on CoW
+                        and journaled file systems (see man shred).
+    -v, --verbose       Produce more verbose output.
+
+Other arguments:
+
+    --version           Print version information and exit.
+    -h, --help          Print usage information and exit.
+
+Examples:
+
+Pack ~/mydata directory into archive file myarchive.tar.gpg:
+
+    serp --pack --name myarchive ~/mydata
+
+Unpack archive myarchive.tar.gpg into directory ~/mydata:
+
+    serp --unpack --name myarchive.tar.gpg ~/mydata
+
+Report bugs to: https://github.com/ovk/serp/issues
+Serp home page: https://github.com/ovk/serp
+"
+}
+
+parse_options() {
+    opt_redundancy="10"
+
+    options="hpun:vr:X"
+    long_options="version,help,pack,unpack,name:,verbose,redundancy:,delete"
+
+    if ! parsed_options=$(getopt --options=$options --longoptions=$long_options --name "$0" -- "$@"); then
+        err "Invalid command line arguments. Run with -h to see help."
+        exit 64
+    fi
+
+    eval set -- "$parsed_options"
+    while true ; do
+        case "$1" in
+            --version)       print_version ; exit 0 ;;
+            -h|--help)       usage ; exit 0 ;;
+            -v|--verbose)    opt_verbose="-v" ; shift ;;
+            -p|--pack)       opt_pack=1 ; shift ;;
+            -u|--unpack)     opt_unpack=1 ; shift ;;
+            -X|--delete)     opt_delete=1 ; shift ;;
+            -n|--name)       opt_name="$2" ; shift ; shift ;;
+            -r|--redundancy) opt_redundancy="$2" ; shift ; shift ;;
+            --)
+                shift
+                break ;;
+            *)
+                err "Internal script error: unexpected command line argument encountered."
+                exit 70 ;;
+        esac
+    done
+
+    # Validate target directory
+    if [ "$#" -eq "0" ]; then
+        err "Please provide target directory name. Run with -h to see help."
+        exit 64
+    elif [ "$#" -gt "1" ]; then
+        err "Only one directory can be packed/unpacked at a time. Run with -h to see help."
+        exit 64
+    fi
+
+    opt_target="$1"
+
+    # Set default package name (if not specified)
+    if [ -z "$opt_name" ]; then
+        opt_name=$(basename "$opt_target")
+    fi
+
+    # Action specific validation
+    if [ -n "$opt_pack" ]; then
+        # Make sure target directory exists
+        if [ ! -d "$opt_target" ]; then
+            err "'$opt_target' does not exist or is not a directory."
+            exit 66
+        fi
+
+        # Make sure target directory is not empty
+        if [ ! "$(ls -A "$opt_target")" ]; then
+            err "'$opt_target' directory is empty: nothing to pack."
+            exit 66
+        fi
+    elif [ -n "$opt_unpack" ]; then
+        # Make sure archive file exists
+        if [ ! -e "$opt_name.tar.gpg" ]; then
+            err "File '$opt_name.tar.gpg' is not found. If package file has different name it can be passed with --name."
+            exit 66
+        fi
+
+        # Make sure target directory doesn't exist
+        if [ -e "$opt_target" ]; then
+            err "Target directory '$opt_target' already exists. Please use not existing directory as a target, since it will be created by serp."
+            exit 64
+        fi
+    else
+        err "An action (--pack or --unpack) must be provided. Run with -h to see help."
+        exit 64
+    fi
+}
+
+do_pack() {
+    # Packing requires par2 to generate parity information, make sure it exists
+    if  ! has par2; then
+        err "'par2' is not found. Make sure it is installed on your system."
+        exit 69
+    fi
+
+    printf "%s\n" "Packing '$opt_target' into '$opt_name.tar.gpg'..."
+
+    # Package all files inside the target directory into a tar archive
+    dbg "-- Creating tar archive '$opt_name.tar' from contents of '$opt_target'"
+    if ! tar "$opt_verbose" -cf "$opt_name.tar" -C "$opt_target" . ; then
+        err "Failed to 'tar' contents of the '$opt_target' directory into tar archive '$opt_name.tar'."
+        exit 70
+    fi
+
+    # Encrypt tar archive using gpg
+    dbg "-- Compressing and encrypting tar archive '$opt_name.tar'"
+    if ! gpg $opt_verbose --yes --cipher-algo AES256 -o "$opt_name.tar.gpg" --symmetric "$opt_name.tar"; then
+        err "Failed to encrypt tar archive '$opt_name.tar'."
+        exit 70
+    fi
+
+    # Delete tar archive
+    dbg "-- Deleting tar archive '$opt_name.tar'"
+    if ! rm "$opt_name.tar"; then
+        err "Failed to delete intermediate tar archive '$opt_name.tar'"
+        exit 70
+    fi
+
+    # Calculate SHA1 checksum
+    dbg "-- Calculating SHA1 checksum of '$opt_name.tar.gpg' into '$opt_name.tar.gpg.sha1'"
+    if ! sha1sum -b "$opt_name.tar.gpg" > "$opt_name.tar.gpg.sha1"; then
+        err "Failed to calculate checksum of '$opt_name.tar.gpg'."
+        exit 70
+    fi
+
+    # Generate parity information
+    if [ -z $opt_verbose ]; then
+        par2_quiet="-qq"
+    fi
+
+    dbg "-- Generating parity information with redundancy level of $opt_redundancy%"
+    if ! par2 create "$opt_verbose" "$par2_quiet" "-r$opt_redundancy" -n1 "$opt_name.tar.gpg" "$opt_name.tar.gpg"; then
+        err "Failed to generate parity information."
+        exit 70
+    fi
+
+    printf "%s\n" "Done."
+
+    # Delete original directory, if requested
+    if [ -n "$opt_delete" ]; then
+        printf "%s" "Deleting '$opt_target' directory... "
+        rm -rf "$opt_target"
+        printf "%s\n" "Done."
+    fi
+}
+
+do_unpack() {
+    printf "%s\n" "Unpacking '$opt_name.tar.gpg' into '$opt_target' ..."
+
+    # Verify checksum (if it exists)
+    if [ -e "$opt_name.tar.gpg.sha1" ]; then
+        dbg "-- Verifying SHA1 checksum from file '$opt_name.tar.gpg.sha1'"
+        if ! sha1sum --status -c "$opt_name.tar.gpg.sha1"; then
+            err "SHA1 checksum verification failed - file '$opt_name.tar.gpg' is probably corrupted!"
+            err "Try running verification with par2, for example: par2 verify '$opt_name.tar.gpg.par2'"
+            err "To repair file try: par2 repair '$opt_name.tar.gpg.par2'"
+            err "Re-run serp unpacking once file is repaired."
+            exit 65
+        fi
+    else
+        printf "[Warning] %s\n" "SHA1 checksum file '$opt_name.tar.gpg.sha1' is not found - skipping checksum verification."
+    fi
+
+    # Create target directory
+    dbg "-- Creating target directory '$opt_target'"
+    if ! mkdir "$opt_target"; then
+        err "Cannot create target directory '$opt_target'."
+        exit 73
+    fi
+
+    # Decrypt GPG-encrypted tar archive
+    tar_filename=$(basename "$opt_target/$opt_name.tar")
+
+    dbg "-- Decompressing and decrypting '$opt_name.tar.gpg' into '$opt_target/$tar_filename'"
+    if ! gpg $opt_verbose -o "$opt_target/$tar_filename" --decrypt "$opt_name.tar.gpg"; then
+        err "Failed to decrypt archive '$opt_name.tar.gpg'"
+        exit 70
+    fi
+
+    # Extract tar archive
+    dbg "-- Extracting tar archive '$opt_target/$tar_filename'"
+    if ! tar "$opt_verbose" -xf "$opt_target/$tar_filename" -C "$opt_target"; then
+        err "Failed to extract tar archive '$opt_target/$tar_filename'"
+        exit 70
+    fi
+
+    # Delete tar archive
+    dbg "-- Deleting tar archive '$opt_target/$tar_filename'"
+    if ! rm "$opt_target/$tar_filename"; then
+        err "Failed to delete decrypted tar archive '$opt_target/$tar_filename'"
+        exit 70
+    fi
+
+    printf "%s\n" "Done."
+}
+
+main() {
+    # Ensure enhanced getopt version
+    getopt --test
+    if [ "$?" -ne "4" ]; then
+        err "Unsupported getopt version."
+        exit 69
+    fi
+
+    # Parse and validate command line arguments
+    parse_options "$@"
+
+    # Make sure tools that required for both packing and unpacking exist
+    if ! has tar; then
+        err "'tar' is not found. Make sure it is installed on your system."
+        exit 69
+    fi
+
+    if ! has gpg; then
+        err "'gpg' is not found. Make sure it is installed on your system."
+        exit 69
+    fi
+
+    if ! has sha1sum; then
+        err "'sha1sum' is not found. Make sure it is installed on your system."
+        exit 69
+    fi
+
+    # Perform requested action
+    if [ -n "$opt_pack" ]; then
+        do_pack
+    else
+        do_unpack
+    fi
+}
+
+main "$@"
+
